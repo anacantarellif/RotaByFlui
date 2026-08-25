@@ -52,14 +52,9 @@ Recurso tratado como requisito funcional, não como polimento final — constru�
 ## 🚀 Rodando o projeto
 
 ```bash
-cd mobile
 npm install
 npx expo start
 ```
-
-Pressione `a` para Android, `i` para iOS (simulador), ou escaneie o QR code com o app **Expo Go** em um aparelho físico.
-
-> O mapa (`react-native-maps`) precisa de uma build nativa para renderizar o Google Maps no Android — veja `mobile/README.md` para configurar a chave de API. No Expo Go, o app roda normalmente com o provedor de mapa padrão.
 
 ## 👥 Equipe
 
