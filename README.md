@@ -1,7 +1,5 @@
 # ⚡ Rota by Flui
 
-**Encontre, avalie e planeje suas recargas — feito por e para motoristas de veículos elétricos.**
-
 Projeto acadêmico desenvolvido para o **Enterprise Challenge (FIAP)** — Etapa 2. A Etapa 1 propôs a experiência em um protótipo navegável no Figma; esta etapa transforma essa proposta em um **aplicativo mobile real e funcional**, construído em React Native.
 
 ---
