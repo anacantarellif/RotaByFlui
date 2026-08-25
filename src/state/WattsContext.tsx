@@ -1,10 +1,4 @@
-// Real, persisted Watts total — new state, not in the source, which only ever
-// showed a static `DATA.user.watts` number and separately displayed a "+N
-// Watts" toast on rating/reporting that never actually added up to anything
-// (the toast text and the profile number were two unrelated things). Every
-// action that already claims a Watts reward (RateFlow's rating flow,
-// MapScreen's ReportSheet) now calls addWatts() with that same amount, so the
-// number ProfileScreen shows is the real running total, not a fixed mock.
+
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { DATA } from '../data/data';

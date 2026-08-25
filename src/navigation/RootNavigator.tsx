@@ -7,7 +7,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { OnboardingScreen } from '../screens/OnboardingScreen';
 import { TabNavigator } from './TabNavigator';
-import { RootStackParamList } from './types';
+import { RootStackParamList } from '../data/types';
 
 const ONBOARDED_KEY = 'rota_onboarded';
 

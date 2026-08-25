@@ -7,7 +7,7 @@ import { MapScreen } from '../screens/MapScreen';
 import { RouteScreen } from '../screens/RouteScreen';
 import { CommunityScreen } from '../screens/CommunityScreen';
 import { ProfileScreen } from '../screens/ProfileScreen';
-import { TabParamList } from './types';
+import { TabParamList } from '../data/types';
 
 const Tab = createBottomTabNavigator<TabParamList>();
 
