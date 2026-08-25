@@ -1,0 +1,998 @@
+// Ported from project/app/screens-map.jsx — the main map screen: interactive map
+// with station pins + community-report pins, search, quick/advanced filters, a
+// map/list toggle, and the report/rate/handoff sheets it opens. This is the
+// screen the FIAP Stage 2 brief treats as the minimum deliverable ("o app precisa
+// mostrar... o mapa interativo com os pontos/filtros/fichas").
+//
+// The source's `RateSheet` (also defined in screens-map.jsx) is never actually
+// rendered by its own `MapScreen` — grepped: zero JSX usage, only exported via
+// `Object.assign(window, ...)` for other files that don't call it either. The
+// real 3-step rating flow used here is `RateFlow` (rating.jsx, already ported to
+// src/components/rating/RateFlow.tsx), so `RateSheet` is dead code in the source
+// and is not ported.
+//
+// Per PORTING_GUIDE.md, `favs`/`onToggleFav`/`pushToast` come from
+// useFavorites()/useToast() instead of being threaded through props, `onNavigate`
+// is gone (MapsHandoffSheet navigates via useNavigation() itself), and `density`/
+// `showReports` read from useTheme() instead of being passed in.
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Animated, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Image } from 'expo-image';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Icon, IconName, Seal } from '../components/icons/Icon';
+import { GeoMapView } from '../components/map/GeoMapView';
+import { AMEN, AVAIL, Stars, StationSheet } from '../components/station/Station';
+import { EventSheet } from '../components/event/EventSheet';
+import { MapsHandoffSheet } from '../components/handoff/MapsHandoff';
+import { RateFlow } from '../components/rating/RateFlow';
+import { ModalSheet } from '../components/sheets/ModalSheet';
+import { AnimatedPressable } from '../components/motion/AnimatedPressable';
+import { ListSkeleton } from '../components/skeletons/Skeletons';
+import { useDelay } from '../hooks/useDelay';
+import { useReducedMotion } from '../hooks/useReducedMotion';
+import { useScreenReaderEnabled } from '../hooks/useScreenReaderEnabled';
+import { useTheme } from '../theme/ThemeContext';
+import { useToast } from '../state/ToastContext';
+import { useFavorites } from '../state/FavoritesContext';
+import { useWatts } from '../state/WattsContext';
+import { useMissions } from '../state/MissionsContext';
+import { useReviews } from '../state/ReviewsContext';
+import { useCar } from '../state/CarContext';
+import { ROTA_CONFIG } from '../config';
+import { DATA } from '../data/data';
+import { Report, Station } from '../data/types';
+import { stationPhoto } from '../utils/stationPhotos';
+
+// ---- filter data + pure matching logic (ported 1:1 from screens-map.jsx) ----
+
+type Adv = { connectors: string[]; power: number; hours: string; amenities: string[]; minRating: number; seloOnly: boolean };
+const EMPTY_ADV: Adv = { connectors: [], power: 0, hours: 'any', amenities: [], minRating: 0, seloOnly: false };
+
+const CONNECTORS = ['CCS2', 'Type 2', 'GB/T'];
+const POWER_STEPS = [0, 22, 50, 100, 150];
+const RATING_STEPS = [0, 3.5, 4, 4.5];
+const HOURS_OPTS: { id: string; label: string }[] = [
+  { id: 'any', label: 'Qualquer horário' },
+  { id: 'open', label: 'Aberto agora' },
+  { id: '24h', label: 'Aberto 24 h' },
+  { id: 'late', label: 'Aberto após 22 h' },
+];
+const AMEN_FILTER = ['coffee', 'food', 'wc', 'parking', 'wifi', 'shield', 'store'] as const;
+
+const QUICK: { id: string; label: string; test: (s: Station) => boolean }[] = [
+  { id: 'now', label: 'Livre agora', test: (s) => s.avail === 'ok' },
+  { id: 'selo', label: 'Selo Flui', test: (s) => s.selo > 0 },
+  { id: 'cover', label: 'Coberto', test: (s) => s.cover },
+];
+
+function parseHours(h: string): { open: number; close: number; always: boolean } {
+  if (/24/.test(h)) return { open: 0, close: 24, always: true };
+  const m = h.match(/(\d{1,2})h\s*[–-]\s*(\d{1,2})h/);
+  if (!m) return { open: 0, close: 24, always: true };
+  const open = +m[1];
+  const closeRaw = +m[2];
+  return { open, close: closeRaw === 0 ? 24 : closeRaw, always: false };
+}
+function hoursTest(st: Station, opt: string, nowHour: number): boolean {
+  const { open, close, always } = parseHours(st.hours);
+  if (opt === 'any') return true;
+  if (opt === '24h') return always;
+  if (opt === 'late') return always || close >= 22 || close <= 2;
+  if (always) return true;
+  return close > open ? nowHour >= open && nowHour < close : nowHour >= open || nowHour < close;
+}
+function matchAdv(st: Station, adv: Adv, quick: string[], nowHour: number): boolean {
+  for (const id of quick) {
+    const q = QUICK.find((x) => x.id === id);
+    if (q && !q.test(st)) return false;
+  }
+  if (adv.connectors.length && !adv.connectors.every((c) => st.connectors.includes(c))) return false;
+  if (adv.power && st.power < adv.power) return false;
+  if (!hoursTest(st, adv.hours, nowHour)) return false;
+  if (adv.amenities.length && !adv.amenities.every((a) => st.amenities.includes(a))) return false;
+  if (adv.minRating && st.rating < adv.minRating) return false;
+  if (adv.seloOnly && !(st.selo > 0)) return false;
+  return true;
+}
+function countAdv(adv: Adv): number {
+  return (
+    adv.connectors.length +
+    (adv.power ? 1 : 0) +
+    (adv.hours !== 'any' ? 1 : 0) +
+    adv.amenities.length +
+    (adv.minRating ? 1 : 0) +
+    (adv.seloOnly ? 1 : 0)
+  );
+}
+
+// A report's `station` field is free-text flavor label, not a real reference
+// to a DATA.stations entry — some don't even match a station name exactly
+// (e.g. r2's "Posto Ipiranga · Faria Lima" vs. the actual nearby station
+// "Posto Berrini Energy"). Real lat/lng exist on both, so matching by
+// closest coordinate is the reliable way to resolve which station a report
+// is actually about — used when a report is tapped a second time to open
+// that station's ficha (see MapScreen's onReport below).
+function nearestStation(r: Report): Station {
+  let best = DATA.stations[0];
+  let bestDist = Infinity;
+  for (const st of DATA.stations) {
+    const d = (st.lat - r.lat) ** 2 + (st.lng - r.lng) ** 2;
+    if (d < bestDist) {
+      bestDist = d;
+      best = st;
+    }
+  }
+  return best;
+}
+
+// ---- shared Chip (quick filters, FilterSheet toggles) ----
+
+function Chip({
+  label,
+  icon,
+  iconElement,
+  active,
+  onPress,
+  role = 'button',
+  a11yLabel,
+}: {
+  label: string;
+  icon?: IconName;
+  /** Custom leading icon (e.g. the Selo Flui badge) in place of a plain Icon glyph. */
+  iconElement?: React.ReactNode;
+  active?: boolean;
+  onPress: () => void;
+  role?: 'button' | 'switch' | 'radio';
+  a11yLabel?: string;
+}) {
+  const { colors, font } = useTheme();
+  const reduced = useReducedMotion();
+  // "Fills" from the empty to the selected look instead of snapping — 0 = fully
+  // unselected colors, 1 = fully selected. Interpolating background/border/text
+  // color (RN's Animated supports color strings directly) reads as the chip
+  // filling in, rather than the harder flip a plain conditional style gives.
+  const fill = useRef(new Animated.Value(active ? 1 : 0)).current;
+
+  useEffect(() => {
+    Animated.timing(fill, { toValue: active ? 1 : 0, duration: reduced ? 0 : 200, useNativeDriver: false }).start();
+  }, [active, reduced, fill]);
+
+  const backgroundColor = fill.interpolate({ inputRange: [0, 1], outputRange: [colors.surface, colors.primary] });
+  const borderColor = fill.interpolate({ inputRange: [0, 1], outputRange: [colors.line, colors.primary] });
+  const textColor = fill.interpolate({ inputRange: [0, 1], outputRange: [colors.ink, '#ffffff'] });
+
+  return (
+    <AnimatedPressable
+      onPress={onPress}
+      accessibilityRole={role}
+      accessibilityState={role === 'button' ? undefined : { checked: !!active }}
+      accessibilityLabel={a11yLabel ?? label}
+      hitSlop={4}
+      scaleTo={0.94}
+      // Purely static layout here — no animated values. AnimatedPressable
+      // merges this with its own native-driven scale transform on ONE
+      // Animated node; mixing a JS-driven interpolated color (fill isn't
+      // useNativeDriver, color interpolation needs it) into that same style
+      // object crashes with "Attempting to run JS driven animation on
+      // animated node that has been moved to 'native'" the moment both
+      // animations are live at once (reported: opening Filtros). The
+      // JS-driven fill colors live on their own separate Animated.View below
+      // instead — a different node, no conflict — absolutely filling this
+      // one, which is why this needs its own borderRadius + overflow:hidden
+      // to clip that layer's corners.
+      style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 6,
+        minHeight: 36,
+        paddingVertical: 8,
+        paddingHorizontal: 14,
+        borderRadius: 100,
+        overflow: 'hidden',
+      }}
+    >
+      <Animated.View
+        pointerEvents="none"
+        style={[StyleSheet.absoluteFill, { borderRadius: 100, backgroundColor, borderWidth: 1.5, borderColor }]}
+      />
+      {iconElement ?? (icon && <Icon name={icon} size={14} color={active ? '#fff' : colors.primary} />)}
+      <Animated.Text style={{ fontFamily: font.uiSemibold, fontSize: 12.5, color: textColor }}>{label}</Animated.Text>
+    </AnimatedPressable>
+  );
+}
+
+// ---- FilterSheet ----
+//
+// The source's "Potência mínima" control is a discrete 5-step `<input type=range>`
+// with a scale legend under it. RN has no native range-slider primitive (the
+// battery slider elsewhere in the app needed a hand-built PanResponder/gesture
+// track), and for 5 fixed steps a row of selectable chips communicates the exact
+// same discrete choice with less code and better built-in accessibility (each
+// step is its own `role="radio"` element instead of one `adjustable` slider) — so
+// that's what this uses instead of reimplementing a drag track.
+function FilterSheet({
+  adv,
+  quick,
+  nowHour,
+  stations,
+  onClose,
+  onApply,
+}: {
+  adv: Adv;
+  quick: string[];
+  nowHour: number;
+  stations: Station[];
+  onClose: () => void;
+  onApply: (v: Adv) => void;
+}) {
+  const { colors, font, space } = useTheme();
+  const [local, setLocal] = useState<Adv>(adv);
+  const set = (patch: Partial<Adv>) => setLocal((l) => ({ ...l, ...patch }));
+  const toggleConnector = (c: string) =>
+    setLocal((l) => ({ ...l, connectors: l.connectors.includes(c) ? l.connectors.filter((x) => x !== c) : [...l.connectors, c] }));
+  const toggleAmenity = (a: string) =>
+    setLocal((l) => ({ ...l, amenities: l.amenities.includes(a) ? l.amenities.filter((x) => x !== a) : [...l.amenities, a] }));
+  const live = stations.filter((s) => matchAdv(s, local, quick, nowHour)).length;
+
+  return (
+    <ModalSheet open onClose={onClose} snapPoints={['86%']} label="Filtros de busca">
+      <View style={{ paddingHorizontal: space.pad, paddingTop: 4 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
+          <View>
+            <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1.5, textTransform: 'uppercase', color: colors.inkFaint }}>
+              Filtros
+            </Text>
+            <Text accessibilityRole="header" style={{ fontFamily: font.display, fontSize: 23, marginTop: 2, color: colors.ink }}>
+              Refinar busca
+            </Text>
+          </View>
+          {/* This sheet had no dismiss control of its own — only ModalSheet's
+              backdrop tap / swipe-down, both unreachable via a screen
+              reader's linear swipe navigation. Reported as the screen
+              reader getting stuck inside it. */}
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <AnimatedPressable
+              onPress={() => setLocal(EMPTY_ADV)}
+              accessibilityRole="button"
+              accessibilityLabel="Limpar filtros"
+              hitSlop={6}
+              style={{ paddingVertical: 8, paddingHorizontal: 14, borderRadius: 100, backgroundColor: colors.surface2 }}
+            >
+              <Text style={{ fontFamily: font.uiSemibold, fontSize: 13, color: colors.ink }}>Limpar</Text>
+            </AnimatedPressable>
+            <AnimatedPressable
+              onPress={onClose}
+              accessibilityRole="button"
+              accessibilityLabel="Fechar filtros"
+              hitSlop={6}
+              style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface2, alignItems: 'center', justifyContent: 'center' }}
+            >
+              <Icon name="x" size={16} color={colors.ink} />
+            </AnimatedPressable>
+          </View>
+        </View>
+
+        <FilterSection title="Avaliação">
+          <View
+            style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}
+            accessibilityRole="radiogroup"
+            accessibilityLabel="Nota mínima"
+          >
+            {RATING_STEPS.map((r) => (
+              <Chip
+                key={r}
+                label={r === 0 ? 'Qualquer nota' : `${r.toFixed(1).replace('.', ',')}+`}
+                icon={r === 0 ? undefined : 'star'}
+                active={local.minRating === r}
+                role="radio"
+                a11yLabel={r === 0 ? 'Qualquer nota' : `Nota ${r.toFixed(1).replace('.', ',')} ou mais`}
+                onPress={() => set({ minRating: r })}
+              />
+            ))}
+          </View>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            <Chip
+              label="Selo Flui"
+              iconElement={<Seal size={14} />}
+              active={local.seloOnly}
+              role="switch"
+              a11yLabel="Somente pontos com Selo Flui"
+              onPress={() => set({ seloOnly: !local.seloOnly })}
+            />
+          </View>
+        </FilterSection>
+
+        <FilterSection title="Tipo de conector">
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {CONNECTORS.map((c) => (
+              <Chip key={c} label={c} icon="plug" active={local.connectors.includes(c)} role="switch" onPress={() => toggleConnector(c)} />
+            ))}
+          </View>
+        </FilterSection>
+
+        <FilterSection title="Potência mínima">
+          <View
+            style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}
+            accessibilityRole="radiogroup"
+            accessibilityLabel="Potência mínima em quilowatts"
+          >
+            {POWER_STEPS.map((p) => (
+              <Chip
+                key={p}
+                label={p === 0 ? 'Todas' : `${p}+ kW`}
+                active={local.power === p}
+                role="radio"
+                a11yLabel={p === 0 ? 'Qualquer potência' : `${p} quilowatts ou mais`}
+                onPress={() => set({ power: p })}
+              />
+            ))}
+          </View>
+          <Text style={{ fontSize: 12, fontWeight: '600', marginTop: 8, color: colors.inkFaint }}>
+            {local.power === 0 ? 'Qualquer potência' : `A partir de ${local.power} kW`}
+          </Text>
+        </FilterSection>
+
+        <FilterSection title="Horário de funcionamento">
+          <View
+            style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}
+            accessibilityRole="radiogroup"
+            accessibilityLabel="Horário de funcionamento"
+          >
+            {HOURS_OPTS.map((h) => (
+              <Chip
+                key={h.id}
+                label={h.label}
+                icon={h.id !== 'any' ? 'clock' : undefined}
+                active={local.hours === h.id}
+                role="radio"
+                onPress={() => set({ hours: h.id })}
+              />
+            ))}
+          </View>
+        </FilterSection>
+
+        <FilterSection title="Comodidades" last>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {AMEN_FILTER.map((a) => {
+              const [icon, label] = AMEN[a];
+              return (
+                <Chip key={a} label={label} icon={icon} active={local.amenities.includes(a)} role="switch" onPress={() => toggleAmenity(a)} />
+              );
+            })}
+          </View>
+        </FilterSection>
+
+        <AnimatedPressable
+          onPress={() => onApply(local)}
+          accessibilityRole="button"
+          style={{
+            marginTop: 4,
+            marginBottom: 8,
+            minHeight: 50,
+            borderRadius: 100,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: colors.primary,
+          }}
+        >
+          <Text style={{ fontFamily: font.uiSemibold, fontSize: 16, color: colors.primaryInk }}>
+            Ver {live} {live === 1 ? 'ponto' : 'pontos'}
+          </Text>
+        </AnimatedPressable>
+      </View>
+    </ModalSheet>
+  );
+}
+
+function FilterSection({ title, children, last }: { title: string; children: React.ReactNode; last?: boolean }) {
+  const { colors } = useTheme();
+  return (
+    <View style={{ marginBottom: last ? 8 : 22 }}>
+      <Text
+        style={{
+          fontSize: 11,
+          fontWeight: '700',
+          letterSpacing: 1.5,
+          textTransform: 'uppercase',
+          color: colors.inkFaint,
+          marginBottom: 10,
+        }}
+      >
+        {title}
+      </Text>
+      {children}
+    </View>
+  );
+}
+
+// ---- ReportSheet ("+" fab: report a situation at/near a station) ----
+
+const REPORT_TYPES: { id: string; icon: IconName; colorToken: 'ok' | 'busy' | 'off' | 'primary'; label: string }[] = [
+  { id: 'livre', icon: 'check', colorToken: 'ok', label: 'Pontos livres' },
+  { id: 'fila', icon: 'users', colorToken: 'busy', label: 'Fila / lotado' },
+  { id: 'quebrado', icon: 'alert', colorToken: 'off', label: 'Fora do ar' },
+  { id: 'preco', icon: 'dollar', colorToken: 'primary', label: 'Preço mudou' },
+  { id: 'bloqueada', icon: 'car', colorToken: 'busy', label: 'Vaga bloqueada' },
+  { id: 'foto', icon: 'camera', colorToken: 'primary', label: 'Adicionar foto' },
+];
+
+const REPORT_WATTS = 40;
+
+// Reports are always tied to the station they're about — there's no longer a
+// standalone "+" fab that lets you file one without picking a point first
+// (that produced reports nothing could be done with: no station to show the
+// report against on the map, in a list, or in that station's own ficha). The
+// only entry point now is the ficha's own report button, so `st` is required.
+function ReportSheet({
+  st,
+  onClose,
+  onDone,
+}: {
+  st: Station;
+  onClose: () => void;
+  onDone: (r: (typeof REPORT_TYPES)[number]) => void;
+}) {
+  const { colors, font, space } = useTheme();
+  const [sel, setSel] = useState<string | null>(null);
+  // This sheet had no explicit snapPoints, so it fell back to ModalSheet's
+  // default ['50%', '90%'] and always opened at the first (50%) point —
+  // not enough room for the title/subtitle + 6 report-type cards + submit
+  // button, so the button rendered right at the edge of the visible sheet,
+  // reachable only by dragging up to the second snap point first (reported
+  // as the submit button looking cut off at the bottom, since most people
+  // never discover that drag). Measuring the real content via onLayout,
+  // same pattern (including `scroll={false}`) as the station peek
+  // card/EventSheet, sizes it exactly so everything (including the button)
+  // is visible without any drag.
+  const [height, setHeight] = useState(430);
+
+  return (
+    <ModalSheet open onClose={onClose} snapPoints={[height]} scroll={false} label={`Reportar situação em ${st.name}`}>
+      <View
+        style={{ paddingHorizontal: space.pad, paddingTop: 4, paddingBottom: 28 }}
+        onLayout={(e) => setHeight(e.nativeEvent.layout.height)}
+      >
+        {/* No dismiss control of its own before — see the same note on
+            FilterSheet above. */}
+        <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginBottom: -4 }}>
+          <AnimatedPressable
+            onPress={onClose}
+            accessibilityRole="button"
+            accessibilityLabel="Fechar reporte"
+            hitSlop={6}
+            style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: colors.surface2, alignItems: 'center', justifyContent: 'center' }}
+          >
+            <Icon name="x" size={16} color={colors.ink} />
+          </AnimatedPressable>
+        </View>
+        <Text style={{ fontSize: 11, fontWeight: '700', letterSpacing: 1.5, textTransform: 'uppercase', color: colors.inkFaint, marginBottom: 4 }}>
+          Reporte da comunidade
+        </Text>
+        <Text accessibilityRole="header" style={{ fontFamily: font.display, fontSize: 23, marginBottom: 4, color: colors.ink }}>
+          O que está rolando?
+        </Text>
+        <Text style={{ fontSize: 14, marginBottom: 18, color: colors.inkSoft }}>{st.name} · ajude quem vem depois</Text>
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10 }} accessibilityRole="radiogroup" accessibilityLabel="Tipo de reporte">
+          {REPORT_TYPES.map((r) => {
+            const on = sel === r.id;
+            const c = colors[r.colorToken];
+            return (
+              <AnimatedPressable
+                key={r.id}
+                onPress={() => setSel(r.id)}
+                accessibilityRole="radio"
+                accessibilityState={{ checked: on }}
+                accessibilityLabel={r.label}
+                style={{
+                  width: '31%',
+                  minHeight: 90,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: 8,
+                  padding: 12,
+                  borderRadius: space.radiusSm,
+                  backgroundColor: on ? colors.primarySoft : colors.surface,
+                  borderWidth: on ? 2 : 1.5,
+                  borderColor: on ? colors.primary : colors.line,
+                }}
+              >
+                <View
+                  style={{
+                    width: 40,
+                    height: 40,
+                    borderRadius: 12,
+                    backgroundColor: colors.surface2,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <Icon name={r.icon} size={20} color={c} />
+                </View>
+                <Text style={{ fontSize: 12, fontWeight: '700', textAlign: 'center', color: colors.ink }}>{r.label}</Text>
+              </AnimatedPressable>
+            );
+          })}
+        </View>
+        <AnimatedPressable
+          onPress={() => sel && onDone(REPORT_TYPES.find((r) => r.id === sel)!)}
+          disabled={!sel}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: !sel }}
+          style={{
+            marginTop: 18,
+            marginBottom: 8,
+            minHeight: 50,
+            borderRadius: 100,
+            alignItems: 'center',
+            justifyContent: 'center',
+            backgroundColor: colors.primary,
+            opacity: sel ? 1 : 0.5,
+          }}
+        >
+          <Text style={{ fontFamily: font.uiSemibold, fontSize: 16, color: colors.primaryInk }}>Enviar reporte · +{REPORT_WATTS} Watts</Text>
+        </AnimatedPressable>
+      </View>
+    </ModalSheet>
+  );
+}
+
+// ---- list view row + empty state ----
+
+function ListRow({ st, onOpen }: { st: Station; onOpen: (st: Station) => void }) {
+  const { colors, font, space } = useTheme();
+  const avColor = colors[st.avail];
+  return (
+    <AnimatedPressable
+      onPress={() => onOpen(st)}
+      accessibilityRole="button"
+      accessibilityLabel={`${st.name}, ${AVAIL[st.avail]}, ${st.free} de ${st.total} livres, ${st.dist}`}
+      scaleTo={0.98}
+      style={{
+        flexDirection: 'row',
+        gap: 12,
+        padding: 12,
+        marginBottom: 10,
+        borderRadius: space.radius,
+        backgroundColor: colors.surface,
+        borderWidth: 1,
+        borderColor: colors.line,
+        alignItems: 'center',
+      }}
+    >
+      <Image
+        source={stationPhoto(st.id)}
+        accessible
+        accessibilityRole="image"
+        accessibilityLabel={`Foto do ponto ${st.name}`}
+        style={{ width: 64, height: 64, borderRadius: 14, backgroundColor: colors.surface2 }}
+        contentFit="cover"
+      />
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          {st.selo > 0 && <Seal size={14} />}
+          <Text numberOfLines={1} style={{ fontFamily: font.display, fontSize: 17, color: colors.inkSoft, flexShrink: 1 }}>
+            {st.name}
+          </Text>
+        </View>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginVertical: 3 }}>
+          <Stars n={st.rating} size={11} label={false} />
+          <Text style={{ fontSize: 12, fontWeight: '700', color: colors.ink }}>{st.rating.toFixed(1)}</Text>
+          <Text style={{ fontSize: 11, color: colors.inkFaint }}>· {st.dist}</Text>
+        </View>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: avColor }} />
+          <Text style={{ fontSize: 12, fontWeight: '600', color: avColor }}>
+            {st.free}/{st.total} livres
+          </Text>
+          <Text
+            style={{
+              marginLeft: 'auto',
+              fontSize: 11,
+              fontWeight: '700',
+              color: colors.primary,
+              backgroundColor: colors.primarySoft,
+              paddingVertical: 3,
+              paddingHorizontal: 8,
+              borderRadius: 100,
+              overflow: 'hidden',
+            }}
+          >
+            {st.power} kW
+          </Text>
+        </View>
+      </View>
+    </AnimatedPressable>
+  );
+}
+
+function EmptyResults({ onClear }: { onClear: () => void }) {
+  const { colors, font, space } = useTheme();
+  return (
+    <View
+      accessibilityRole="text"
+      style={{ padding: 22, borderRadius: space.radius, backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.line, alignItems: 'center' }}
+    >
+      <Icon name="search" size={30} color={colors.inkFaint} />
+      <Text style={{ fontFamily: font.display, fontSize: 18, marginTop: 10, marginBottom: 4, color: colors.ink }}>
+        Nenhum ponto com esses filtros
+      </Text>
+      <Text style={{ fontSize: 13.5, marginBottom: 14, color: colors.inkSoft, textAlign: 'center' }}>
+        Tente ampliar a potência ou remover comodidades.
+      </Text>
+      <AnimatedPressable
+        onPress={onClear}
+        accessibilityRole="button"
+        style={{ minHeight: 44, justifyContent: 'center', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 100, backgroundColor: colors.primary }}
+      >
+        <Text style={{ fontFamily: font.uiSemibold, fontSize: 14, color: colors.primaryInk }}>Limpar filtros</Text>
+      </AnimatedPressable>
+    </View>
+  );
+}
+
+function LegendItem({ color, label }: { color: string; label: string }) {
+  const { colors } = useTheme();
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+      <View style={{ width: 7, height: 7, borderRadius: 3.5, backgroundColor: color }} />
+      <Text style={{ fontSize: 11, fontWeight: '600', color: colors.ink }}>{label}</Text>
+    </View>
+  );
+}
+
+// ---- MapScreen ----
+
+export function MapScreen() {
+  const { colors, font, showReports } = useTheme();
+  const insets = useSafeAreaInsets();
+  const topInset = Math.max(insets.top, 24);
+  const { pushToast } = useToast();
+  const { favs, toggleFav } = useFavorites();
+  const { addWatts } = useWatts();
+  const { recordRating, recordPhoto, recordReport, recordAreaVisit } = useMissions();
+  const { addReview } = useReviews();
+  const { car } = useCar();
+
+  const [active, setActive] = useState<string | null>(null);
+  const [detail, setDetail] = useState(false);
+  const [report, setReport] = useState<{ st: Station } | null>(null);
+  const [rate, setRate] = useState<{ st: Station } | null>(null);
+  const [quick, setQuick] = useState<string[]>([]);
+  const [adv, setAdv] = useState<Adv>(EMPTY_ADV);
+  const [showFilters, setShowFilters] = useState(false);
+  const [q, setQ] = useState('');
+  const [view, setView] = useState<'map' | 'list'>('map');
+  // A screen-reader user can't see the map or reliably find a specific pin by
+  // touch-exploring it, so default to the list once TalkBack/VoiceOver is
+  // detected — a ref guards this so it only applies the default once and
+  // never fights a manual switch back to the map afterwards.
+  const screenReaderEnabled = useScreenReaderEnabled();
+  const appliedScreenReaderDefault = useRef(false);
+  useEffect(() => {
+    if (screenReaderEnabled && !appliedScreenReaderDefault.current) {
+      appliedScreenReaderDefault.current = true;
+      setView('list');
+    }
+  }, [screenReaderEnabled]);
+  const [recenter, setRecenter] = useState(0);
+  const [event, setEvent] = useState<Report | null>(null);
+  const [handoff, setHandoff] = useState<Station | null>(null);
+
+  // Demo clock — matches the source's fixed status-bar time (9:41) used to
+  // evaluate "aberto agora" style filters without a real clock dependency.
+  const nowHour = 9;
+  const listReady = useDelay(ROTA_CONFIG.latency.list, `${view}|${q}|${quick.join()}|${JSON.stringify(adv)}`);
+
+  const toggleQuick = (id: string) => setQuick((f) => (f.includes(id) ? f.filter((x) => x !== id) : [...f, id]));
+  const term = q.trim().toLowerCase();
+  const visible = useMemo(
+    () =>
+      DATA.stations.filter(
+        (s) => matchAdv(s, adv, quick, nowHour) && (!term || s.name.toLowerCase().includes(term) || s.area.toLowerCase().includes(term))
+      ),
+    [adv, quick, term]
+  );
+  const advCount = countAdv(adv);
+  const anyFilter = advCount + quick.length > 0;
+  const activeSt = DATA.stations.find((s) => s.id === active) ?? null;
+  const clearAll = () => {
+    setQuick([]);
+    setAdv(EMPTY_ADV);
+    setQ('');
+  };
+
+  const openPin = (st: Station) => {
+    setActive(st.id);
+    setDetail(false);
+  };
+  const openDetail = () => {
+    setDetail(true);
+    if (activeSt) recordAreaVisit(activeSt.area);
+  };
+  const close = () => {
+    setActive(null);
+    setDetail(false);
+  };
+
+  // Closes the station sheet, then opens a *different* sheet (handoff/report/
+  // rate) shortly after, instead of both in the same tap. Mounting a new
+  // ModalSheet in the same commit that unmounts another was the same race
+  // that made the ficha itself unreliable (see StationSheet in Station.tsx) —
+  // these three transitions couldn't be fixed the same way (merging into one
+  // persistent sheet, since MapsHandoffSheet/ReportSheet/RateFlow are each a
+  // genuinely different sheet, not a mode of the station sheet), so they get
+  // the same "let the old one actually finish closing first" delay instead.
+  const closeStationThen = (fn: () => void) => {
+    close();
+    setTimeout(fn, 280);
+  };
+
+  return (
+    <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      {view === 'map' ? (
+        <GeoMapView
+          stations={visible}
+          active={active}
+          onPin={openPin}
+          onReport={(r) => {
+            // Tapping the same report a second time (it's already open) means
+            // the driver wants to see the station behind it, not the report
+            // again — swap to that station's ficha instead. Same
+            // close-then-open-after-a-delay pattern as closeStationThen
+            // above: EventSheet and StationSheet are separate ModalSheet
+            // instances, so dismissing one and presenting the other in the
+            // same tick is the exact race that made the ficha unreliable
+            // before.
+            if (event?.id === r.id) {
+              setEvent(null);
+              setTimeout(() => openPin(nearestStation(r)), 280);
+            } else {
+              close();
+              setEvent(r);
+            }
+          }}
+          showReports={showReports}
+          recenterSignal={recenter}
+        />
+      ) : (
+        <ScrollView
+          style={{ flex: 1, backgroundColor: colors.bg }}
+          contentContainerStyle={{ paddingTop: 190 + topInset, paddingHorizontal: 16, paddingBottom: 96 }}
+        >
+          {!listReady ? (
+            <ListSkeleton rows={4} />
+          ) : (
+            <>
+              <Text accessibilityLiveRegion="polite" style={{ fontSize: 13, marginBottom: 10, color: colors.inkFaint }}>
+                {visible.length} pontos · ordenado por proximidade
+              </Text>
+              {visible.map((st) => (
+                <ListRow key={st.id} st={st} onOpen={openPin} />
+              ))}
+              {!visible.length && <EmptyResults onClear={clearAll} />}
+            </>
+          )}
+        </ScrollView>
+      )}
+
+      {/* top overlay: search + filters */}
+      <View pointerEvents="box-none" style={{ position: 'absolute', top: 0, left: 0, right: 0, paddingHorizontal: 14, paddingTop: topInset + 10 }}>
+        <View
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 10,
+            paddingHorizontal: 14,
+            minHeight: 50,
+            borderRadius: 100,
+            backgroundColor: colors.surface,
+            borderWidth: 1.5,
+            borderColor: colors.line,
+            shadowColor: '#000',
+            shadowOpacity: 0.08,
+            shadowRadius: 8,
+            elevation: 3,
+          }}
+        >
+          <Icon name="search" size={20} color={colors.inkFaint} />
+          <TextInput
+            value={q}
+            onChangeText={setQ}
+            placeholder="Buscar em São Paulo"
+            placeholderTextColor={colors.inkFaint}
+            accessibilityLabel="Buscar ponto de recarga por nome ou bairro"
+            autoCorrect={false}
+            style={{ flex: 1, minHeight: 44, fontFamily: font.ui, fontSize: 15, color: colors.ink }}
+          />
+          {!!q && (
+            <AnimatedPressable onPress={() => setQ('')} accessibilityRole="button" accessibilityLabel="Limpar busca" hitSlop={8}>
+              <Icon name="x" size={14} color={colors.inkFaint} />
+            </AnimatedPressable>
+          )}
+          <View style={{ flexDirection: 'row', backgroundColor: colors.surface2, borderRadius: 100, padding: 2 }}>
+            <AnimatedPressable
+              onPress={() => setView('map')}
+              accessibilityRole="button"
+              accessibilityState={{ selected: view === 'map' }}
+              accessibilityLabel="Ver no mapa"
+              hitSlop={4}
+              style={{ padding: 8, borderRadius: 100, backgroundColor: view === 'map' ? colors.surface : 'transparent' }}
+            >
+              <Icon name="map" size={16} color={view === 'map' ? colors.primary : colors.inkFaint} />
+            </AnimatedPressable>
+            <AnimatedPressable
+              onPress={() => setView('list')}
+              accessibilityRole="button"
+              accessibilityState={{ selected: view === 'list' }}
+              accessibilityLabel="Ver em lista"
+              hitSlop={4}
+              style={{ padding: 8, borderRadius: 100, backgroundColor: view === 'list' ? colors.surface : 'transparent' }}
+            >
+              <Icon name="layers" size={16} color={view === 'list' ? colors.primary : colors.inkFaint} />
+            </AnimatedPressable>
+          </View>
+        </View>
+
+        {/* Backing card for the chips + result-count row: with just the search
+            pill above, these floated directly over the map with nothing behind
+            them — fine for the chips' own pill backgrounds, but the plain text
+            of the "N pontos encontrados / Limpar tudo" row (shown once a filter
+            is active) had no backing at all and was hard to read over map
+            imagery. Wrapping both in one surface card fixes that and reads as a
+            single toolbar instead of loose floating pieces. */}
+        <View
+          style={{
+            marginTop: 12, backgroundColor: colors.surface, borderRadius: 20, padding: 10,
+            shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 8, elevation: 3,
+          }}
+        >
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8 }}>
+            <Chip
+              label={`Filtros${advCount ? ` · ${advCount}` : ''}`}
+              icon="filter"
+              active={!!advCount}
+              onPress={() => setShowFilters(true)}
+              a11yLabel={`Abrir filtros${advCount ? `, ${advCount} ativos` : ''}`}
+            />
+            {QUICK.map((f) => (
+              <Chip key={f.id} label={f.label} active={quick.includes(f.id)} role="switch" onPress={() => toggleQuick(f.id)} />
+            ))}
+          </ScrollView>
+
+          {anyFilter && (
+            <View
+              style={{
+                flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+                marginTop: 10, paddingTop: 10, paddingHorizontal: 4, borderTopWidth: 1, borderTopColor: colors.line,
+              }}
+            >
+              <Text accessibilityLiveRegion="polite" style={{ fontSize: 12.5, fontWeight: '600', color: colors.inkFaint }}>
+                {visible.length} {visible.length === 1 ? 'ponto encontrado' : 'pontos encontrados'}
+              </Text>
+              <AnimatedPressable onPress={clearAll} accessibilityRole="button" accessibilityLabel="Limpar todos os filtros" hitSlop={6}>
+                <Text style={{ fontSize: 12.5, fontWeight: '700', color: colors.primary }}>Limpar tudo</Text>
+              </AnimatedPressable>
+            </View>
+          )}
+        </View>
+      </View>
+
+      {view === 'map' && !visible.length && (
+        <View style={{ position: 'absolute', left: 20, right: 20, top: '38%' }} pointerEvents="box-none">
+          <EmptyResults onClear={clearAll} />
+        </View>
+      )}
+
+      {view === 'map' && !active && (
+        <View style={{ position: 'absolute', right: 14, bottom: 22, gap: 12 }}>
+          <AnimatedPressable
+            onPress={() => setRecenter((r) => r + 1)}
+            accessibilityRole="button"
+            accessibilityLabel="Centralizar na minha localização"
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: 22,
+              backgroundColor: colors.surface,
+              alignItems: 'center',
+              justifyContent: 'center',
+              shadowColor: '#000',
+              shadowOpacity: 0.12,
+              shadowRadius: 6,
+              elevation: 3,
+            }}
+          >
+            <Icon name="crosshair" size={20} color={colors.primary} />
+          </AnimatedPressable>
+        </View>
+      )}
+
+      {view === 'map' && !active && (
+        <View style={{ position: 'absolute', left: 14, bottom: 26 }}>
+          <View
+            style={{
+              flexDirection: 'row',
+              gap: 12,
+              paddingVertical: 8,
+              paddingHorizontal: 12,
+              borderRadius: 100,
+              backgroundColor: colors.surface,
+              shadowColor: '#000',
+              shadowOpacity: 0.1,
+              shadowRadius: 6,
+              elevation: 3,
+            }}
+          >
+            <LegendItem color={colors.ok} label="Livre" />
+            <LegendItem color={colors.busy} label="Cheio" />
+            <LegendItem color={colors.off} label="Off" />
+          </View>
+        </View>
+      )}
+
+      {active && activeSt && (
+        <StationSheet
+          st={activeSt}
+          mode={detail ? 'detail' : 'peek'}
+          onOpenDetail={openDetail}
+          onClose={close}
+          onNavigate={(s) => closeStationThen(() => setHandoff(s))}
+          onReport={(s) => closeStationThen(() => setReport({ st: s }))}
+          onRate={(s) => closeStationThen(() => setRate({ st: s }))}
+          fav={favs.has(activeSt.id)}
+          onFav={(s) => toggleFav(s.id)}
+        />
+      )}
+      {report && (
+        <ReportSheet
+          st={report.st}
+          onClose={() => setReport(null)}
+          onDone={(r) => {
+            setReport(null);
+            addWatts(REPORT_WATTS);
+            recordReport();
+            pushToast(`Reporte enviado · ${r.label}`, 'check', true);
+          }}
+        />
+      )}
+      {event && <EventSheet report={event} onClose={() => setEvent(null)} />}
+      {showFilters && (
+        <FilterSheet
+          adv={adv}
+          quick={quick}
+          nowHour={nowHour}
+          stations={DATA.stations}
+          onClose={() => setShowFilters(false)}
+          onApply={(v) => {
+            setAdv(v);
+            setShowFilters(false);
+          }}
+        />
+      )}
+      {rate && (
+        <RateFlow
+          target={rate.st}
+          kind="station"
+          onClose={() => setRate(null)}
+          onDone={(r) => {
+            setRate(null);
+            addWatts(r.watts);
+            recordRating();
+            if (r.photos > 0) recordPhoto();
+            addReview(rate.st.id, {
+              who: 'Você',
+              when: 'agora',
+              stars: r.stars,
+              body: r.body || 'Avaliação sem comentário.',
+              helpful: 0,
+              car: `${car.brand} ${car.model}`,
+              photoUri: r.photoUris[0],
+            });
+            pushToast(r.selo ? `Avaliação + indicação ao Selo Flui · +${r.watts} W` : `Avaliação publicada · +${r.watts} Watts`, 'check', true);
+          }}
+        />
+      )}
+      {handoff && <MapsHandoffSheet dest={handoff} onClose={() => setHandoff(null)} />}
+    </View>
+  );
+}

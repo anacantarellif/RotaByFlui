@@ -1,0 +1,418 @@
+// Ported from project/app/maps.jsx — Google Maps / Waze handoff sheets.
+//
+// MapsHandoffSheet: shown from a station's "Navegar" action, lets the driver
+// pick Google Maps or Waze, with the station's real coordinates.
+// RouteHandoffSheet: shown at the end of a roteiro (itinerary), hands the whole
+// route (all stops as waypoints, when we have real coordinates for them — see
+// below) to Google Maps or the final stop to Waze.
+//
+// Per product decision, there's no in-app turn-by-turn option here (the source's
+// "Navegar no Rota" pick, which used to route to a Nav screen) — navigation
+// always hands off to an external app with the correct coordinates instead of
+// being driven inside the app. Simpler, and per the same decision, motion/UX
+// polish elsewhere matters a lot more than an in-app nav screen would.
+//
+// Not a 1:1 port, on purpose (per the porting task):
+//   - The source's `window.open(url, '_blank')` is replaced with real deep links via
+//     RN `Linking` (`Linking.canOpenURL` + `Linking.openURL`), since this is a native
+//     app, not a browser tab. Both URLs used (google.com/maps/dir + waze.com/ul) are
+//     plain https:// links, so `canOpenURL` succeeds on-device even without the
+//     Google Maps/Waze app installed — the OS just opens it in-browser instead. We
+//     still check + catch so we can fall back to a toast if `openURL` ever rejects.
+//   - The source's per-station `GEO`/`DEFAULT_GEO` lookup table doesn't exist here:
+//     `src/data/data.ts` already carries real `lat`/`lng` on every `Station`, so we
+//     read `dest.lat` / `dest.lng` straight off the prop instead of looking anything up.
+//   - The source's `<iframe src={gmapsEmbed(...)}>` (a live, keyless Google Maps
+//     embed) has no RN equivalent without a WebView + billing-enabled API key —
+//     but the app's *own* main map already renders a real Google-provided map on
+//     Android with no key at all (docs/MAPS.md §1), so the preview here
+//     (MiniMapPreview, src/components/map/MiniMapPreview.tsx) reuses that same
+//     setup at a small, non-interactive (liteMode on Android) size instead of
+//     showing a text+glyph placeholder standing in for a real image.
+//   - `pushToast` is no longer a prop; it comes from `useToast()`.
+//
+// Route waypoints: `RouteHandoffSheet` reads `guide.stops[].lat/lng` directly
+// (see `src/data/types.ts` — `GuideStop.lat`/`lng`, populated in `src/data/data.ts`
+// from the source's own `GUIDE_GEO` table in project/app/maps.jsx, which the
+// original data port hadn't carried over). An earlier version of this file tried
+// to *guess* stop coordinates by fuzzy-matching each stop's name against
+// `DATA.stations` — that never matched anything (the guides' curated stops and the
+// 7 charging stations are two unrelated datasets) and every route silently
+// degraded to a text-only destination with no waypoints. Reading the real
+// coordinates fixes that outright instead of matching harder.
+import React, { useMemo, useState } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
+import { ModalSheet } from '../sheets/ModalSheet';
+import { AnimatedPressable } from '../motion/AnimatedPressable';
+import { Icon, Seal } from '../icons/Icon';
+import { GoogleGlyph, WazeGlyph } from '../icons/BrandGlyphs';
+import { MiniMapPreview } from '../map/MiniMapPreview';
+import { useTheme } from '../../theme/ThemeContext';
+import { useToast } from '../../state/ToastContext';
+import { Station, Guide } from '../../data/types';
+import { gmapsUrl, wazeUrl, openExternalUrl } from '../../utils/externalNav';
+
+type LatLng = { lat: number; lng: number };
+type AppId = 'gmaps' | 'waze';
+
+function guideStopCoords(guide: Guide): LatLng[] {
+  const coords: LatLng[] = [];
+  for (const s of guide.stops) {
+    if (s.lat != null && s.lng != null) coords.push({ lat: s.lat, lng: s.lng });
+  }
+  return coords;
+}
+
+function guideTextDestination(guide: Guide): string {
+  const last = guide.stops[guide.stops.length - 1];
+  return `${last?.name ?? guide.title}, ${guide.region}`;
+}
+
+function gmapsRouteUrl(guide: Guide): string {
+  const pts = guideStopCoords(guide);
+  if (pts.length === 0) {
+    const q = encodeURIComponent(guideTextDestination(guide));
+    return `https://www.google.com/maps/dir/?api=1&destination=${q}&travelmode=driving`;
+  }
+  const fmt = (p: LatLng) => `${p.lat},${p.lng}`;
+  let url = `https://www.google.com/maps/dir/?api=1&destination=${fmt(pts[pts.length - 1])}&travelmode=driving`;
+  if (pts.length > 1) {
+    url += `&origin=${fmt(pts[0])}`;
+    const mid = pts.slice(1, -1);
+    if (mid.length) url += `&waypoints=${mid.map(fmt).join('|')}`;
+  }
+  return url;
+}
+function wazeRouteUrl(guide: Guide): string {
+  const pts = guideStopCoords(guide);
+  if (pts.length === 0) {
+    const q = encodeURIComponent(guideTextDestination(guide));
+    return `https://waze.com/ul?q=${q}&navigate=yes`;
+  }
+  const last = pts[pts.length - 1];
+  return `https://waze.com/ul?ll=${last.lat},${last.lng}&navigate=yes`;
+}
+
+// ---- brand glyphs -----------------------------------------------------------
+// Fixed brand-identity colors (Google's four-color mark, Waze's cyan) — these are
+// official app marks, not themeable UI, so literal hex here is intentional (same
+// as the source, which also hardcodes these instead of reading CSS vars).
+
+// ---- MapsHandoffSheet -----------------------------------------------------
+
+type MapsApp = { id: AppId; name: string; sub: string; badge?: string };
+
+const MAPS_APPS: MapsApp[] = [
+  { id: 'gmaps', name: 'Google Maps', sub: 'Trânsito em tempo real', badge: 'Recomendado' },
+  { id: 'waze', name: 'Waze', sub: 'Alertas da comunidade' },
+];
+
+export function MapsHandoffSheet({
+  dest,
+  onClose,
+}: {
+  dest: Station;
+  onClose: () => void;
+}) {
+  const { colors, space, font } = useTheme();
+  const { pushToast } = useToast();
+  const [pick, setPick] = useState<AppId>('gmaps');
+  const [remember, setRemember] = useState(false);
+  const activeApp = MAPS_APPS.find((a) => a.id === pick)!;
+
+  const go = async () => {
+    const url = pick === 'gmaps' ? gmapsUrl(dest.lat, dest.lng) : wazeUrl(dest.lat, dest.lng);
+    const appName = pick === 'gmaps' ? 'Google Maps' : 'Waze';
+    const opened = await openExternalUrl(url);
+    onClose();
+    pushToast(opened ? `Abrindo no ${appName}…` : `${appName} não está instalado`, opened ? 'nav' : 'alert');
+  };
+
+  const styles = useHandoffStyles();
+  // This sheet's content (preview + coords + app rows + remember toggle + 2
+  // buttons) is taller than ModalSheet's default 50% initial snap, so the
+  // "Prévia do Google Maps" box was landing below the fold — reachable by
+  // dragging up, but not visible on open (reported as "a prévia não
+  // aparece"). A flat 85% fixed that, but overshoots for this sheet's actual
+  // content on most screens, leaving a visible gap below "Cancelar"
+  // (reported separately). Measuring the content itself via onLayout, same
+  // pattern (including `scroll={false}`) as the station peek card and
+  // EventSheet, sizes it exactly.
+  const [height, setHeight] = useState(580);
+
+  return (
+    <ModalSheet open onClose={onClose} snapPoints={[height]} scroll={false} label={`Como navegar até ${dest.name}`}>
+      <View
+        style={{ paddingHorizontal: space.pad, paddingTop: 4, paddingBottom: 30 }}
+        onLayout={(e) => setHeight(e.nativeEvent.layout.height)}
+      >
+        <Text style={[styles.eyebrow, { color: colors.inkFaint }]}>Navegar até</Text>
+        <View style={styles.kv}>
+          <Text
+            style={[styles.title, { color: colors.ink, fontFamily: font.display }]}
+            numberOfLines={1}
+            ellipsizeMode="tail"
+          >
+            {dest.name}
+          </Text>
+          {dest.selo > 0 && <Seal size={16} label={`Selo Flui nível ${dest.selo}`} />}
+        </View>
+
+        <MiniMapPreview points={[{ lat: dest.lat, lng: dest.lng }]} />
+
+        <View style={styles.coordsRow}>
+          <Icon name="target" size={12} color={colors.inkFaint} />
+          <Text style={[styles.coordsText, { color: colors.inkFaint, fontFamily: font.mono }]}>
+            {dest.lat.toFixed(4)}, {dest.lng.toFixed(4)}
+            {dest.area ? ` · ${dest.area}` : ''}
+          </Text>
+        </View>
+
+        <View style={styles.appList} accessibilityRole="radiogroup" accessibilityLabel="Escolha o aplicativo de navegação">
+          {MAPS_APPS.map((a) => {
+            const on = pick === a.id;
+            return (
+              <AnimatedPressable
+                key={a.id}
+                onPress={() => setPick(a.id)}
+                accessibilityRole="radio"
+                accessibilityState={{ checked: on }}
+                accessibilityLabel={`${a.name}, ${a.sub}`}
+                hitSlop={4}
+                style={[
+                  styles.appRow,
+                  {
+                    backgroundColor: on ? colors.primarySoft : colors.surface,
+                    borderColor: on ? colors.primary : colors.line,
+                    borderWidth: on ? 2 : 1.5,
+                  },
+                ]}
+              >
+                <View style={[styles.glyph, { backgroundColor: on ? colors.surface : colors.surface2 }]}>
+                  {a.id === 'gmaps' ? <GoogleGlyph /> : <WazeGlyph />}
+                </View>
+                <View style={styles.txt}>
+                  <View style={styles.nmRow}>
+                    <Text style={[styles.nm, { color: colors.ink, fontFamily: font.uiSemibold }]}>{a.name}</Text>
+                    {a.badge && (
+                      <View
+                        style={[
+                          styles.rec,
+                          { backgroundColor: on ? colors.primary : colors.surface, borderColor: colors.primary, borderWidth: on ? 0 : 1 },
+                        ]}
+                      >
+                        <Text style={[styles.recText, { color: on ? '#fff' : colors.primary, fontFamily: font.uiSemibold }]}>{a.badge}</Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text style={[styles.sb, { color: colors.inkFaint, fontFamily: font.uiSemibold }]}>{a.sub}</Text>
+                </View>
+                <View style={[styles.radio, { borderColor: on ? colors.primary : colors.lineStrong }]}>
+                  {on && <View style={[styles.radioInd, { backgroundColor: colors.primary }]} />}
+                </View>
+              </AnimatedPressable>
+            );
+          })}
+        </View>
+
+        <AnimatedPressable
+          onPress={() => setRemember((r) => !r)}
+          accessibilityRole="switch"
+          accessibilityState={{ checked: remember }}
+          accessibilityLabel={`Sempre abrir no ${activeApp.name}`}
+          hitSlop={4}
+          style={styles.remember}
+        >
+          <View style={[styles.rememberBox, { backgroundColor: remember ? colors.primary : colors.surface3 }]}>
+            {remember && <Icon name="check" size={13} color="#fff" />}
+          </View>
+          <Text style={[styles.rememberText, { color: colors.inkSoft, fontFamily: font.uiSemibold }]}>
+            Sempre abrir no {activeApp.name}
+          </Text>
+        </AnimatedPressable>
+
+        <AnimatedPressable
+          onPress={go}
+          accessibilityRole="button"
+          accessibilityLabel={`Abrir no ${activeApp.name}`}
+          style={[styles.btnPrimary, { backgroundColor: colors.primary, marginTop: 14 }]}
+        >
+          <Icon name="nav" size={18} color={colors.primaryInk} />
+          <Text style={[styles.btnPrimaryText, { color: colors.primaryInk, fontFamily: font.uiSemibold }]}>
+            Abrir no {activeApp.name}
+          </Text>
+        </AnimatedPressable>
+        <AnimatedPressable
+          onPress={onClose}
+          accessibilityRole="button"
+          accessibilityLabel="Cancelar"
+          style={[styles.btnGhost, { backgroundColor: colors.surface3, marginTop: 8 }]}
+        >
+          <Text style={[styles.btnGhostText, { color: colors.ink, fontFamily: font.uiSemibold, fontSize: space.ui }]}>Cancelar</Text>
+        </AnimatedPressable>
+      </View>
+    </ModalSheet>
+  );
+}
+
+// ---- RouteHandoffSheet ------------------------------------------------------
+
+export function RouteHandoffSheet({
+  guide,
+  onClose,
+}: {
+  guide: Guide;
+  onClose: () => void;
+}) {
+  const { colors, space, font } = useTheme();
+  const { pushToast } = useToast();
+  const [pick, setPick] = useState<AppId>('gmaps');
+  const styles = useHandoffStyles();
+  const stopCoords = useMemo(() => guideStopCoords(guide), [guide]);
+  // Same fixed-85%-overshoots-actual-content fix as MapsHandoffSheet above —
+  // measured via onLayout instead, with the same scroll={false}.
+  const [height, setHeight] = useState(520);
+
+  const routeApps: MapsApp[] = useMemo(
+    () => [
+      { id: 'gmaps', name: 'Google Maps', sub: `Todas as ${guide.stops.length} paradas do guia`, badge: 'Completo' },
+      { id: 'waze', name: 'Waze', sub: 'Vai direto ao destino final' },
+    ],
+    [guide.stops.length]
+  );
+
+  const go = async () => {
+    const url = pick === 'gmaps' ? gmapsRouteUrl(guide) : wazeRouteUrl(guide);
+    const opened = await openExternalUrl(url);
+    onClose();
+    if (!opened) {
+      pushToast(`${pick === 'gmaps' ? 'Google Maps' : 'Waze'} não está instalado`, 'alert');
+      return;
+    }
+    pushToast(pick === 'gmaps' ? 'Roteiro aberto no Google Maps' : 'Destino aberto no Waze', 'nav');
+  };
+
+  return (
+    <ModalSheet open onClose={onClose} snapPoints={[height]} scroll={false} label={`Abrir o roteiro ${guide.title} em outro app`}>
+      <View
+        style={{ paddingHorizontal: space.pad, paddingTop: 4, paddingBottom: 18 }}
+        onLayout={(e) => setHeight(e.nativeEvent.layout.height)}
+      >
+        <Text style={[styles.eyebrow, { color: colors.inkFaint }]}>Levar o roteiro para</Text>
+        <Text style={[styles.title, { color: colors.ink, fontFamily: font.display, marginTop: 2, marginBottom: 12 }]}>
+          {guide.title}
+        </Text>
+
+        <MiniMapPreview points={stopCoords} />
+
+        <View style={[styles.routeStopsNote, { backgroundColor: colors.primarySoft }]}>
+          <Icon name="route" size={15} color={colors.primary} />
+          <Text style={[styles.routeStopsText, { color: colors.primarySoftInk, fontFamily: font.uiSemibold }]}>
+            <Text style={{ fontFamily: font.uiSemibold }}>{guide.stops.length} paradas</Text> vão como pontos de passagem · {guide.distance} km
+          </Text>
+        </View>
+
+        <View style={styles.appList} accessibilityRole="radiogroup" accessibilityLabel="Escolha o aplicativo">
+          {routeApps.map((a) => {
+            const on = pick === a.id;
+            return (
+              <AnimatedPressable
+                key={a.id}
+                onPress={() => setPick(a.id as AppId)}
+                accessibilityRole="radio"
+                accessibilityState={{ checked: on }}
+                accessibilityLabel={`${a.name}, ${a.sub}`}
+                hitSlop={4}
+                style={[
+                  styles.appRow,
+                  {
+                    backgroundColor: on ? colors.primarySoft : colors.surface,
+                    borderColor: on ? colors.primary : colors.line,
+                    borderWidth: on ? 2 : 1.5,
+                  },
+                ]}
+              >
+                <View style={[styles.glyph, { backgroundColor: on ? colors.surface : colors.surface2 }]}>
+                  {a.id === 'gmaps' ? <GoogleGlyph /> : <WazeGlyph />}
+                </View>
+                <View style={styles.txt}>
+                  <View style={styles.nmRow}>
+                    <Text style={[styles.nm, { color: colors.ink, fontFamily: font.uiSemibold }]}>{a.name}</Text>
+                    {a.badge && (
+                      <View
+                        style={[
+                          styles.rec,
+                          { backgroundColor: on ? colors.primary : colors.surface, borderColor: colors.primary, borderWidth: on ? 0 : 1 },
+                        ]}
+                      >
+                        <Text style={[styles.recText, { color: on ? '#fff' : colors.primary, fontFamily: font.uiSemibold }]}>{a.badge}</Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text style={[styles.sb, { color: colors.inkFaint, fontFamily: font.uiSemibold }]}>{a.sub}</Text>
+                </View>
+                <View style={[styles.radio, { borderColor: on ? colors.primary : colors.lineStrong }]}>
+                  {on && <View style={[styles.radioInd, { backgroundColor: colors.primary }]} />}
+                </View>
+              </AnimatedPressable>
+            );
+          })}
+        </View>
+
+        <AnimatedPressable
+          onPress={go}
+          accessibilityRole="button"
+          accessibilityLabel={`Abrir no ${pick === 'gmaps' ? 'Google Maps' : 'Waze'}`}
+          style={[styles.btnPrimary, { backgroundColor: colors.primary, marginTop: 14 }]}
+        >
+          <Icon name="nav" size={18} color={colors.primaryInk} />
+          <Text style={[styles.btnPrimaryText, { color: colors.primaryInk, fontFamily: font.uiSemibold }]}>
+            Abrir no {pick === 'gmaps' ? 'Google Maps' : 'Waze'}
+          </Text>
+        </AnimatedPressable>
+        <AnimatedPressable
+          onPress={onClose}
+          accessibilityRole="button"
+          accessibilityLabel="Cancelar"
+          style={[styles.btnGhost, { backgroundColor: colors.surface3, marginTop: 8 }]}
+        >
+          <Text style={[styles.btnGhostText, { color: colors.ink, fontFamily: font.uiSemibold, fontSize: space.ui }]}>Cancelar</Text>
+        </AnimatedPressable>
+      </View>
+    </ModalSheet>
+  );
+}
+
+function useHandoffStyles() {
+  return useMemo(
+    () =>
+      StyleSheet.create({
+        eyebrow: { fontSize: 11, fontWeight: '700', letterSpacing: 1.8, textTransform: 'uppercase' },
+        kv: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 2, marginBottom: 12 },
+        title: { fontSize: 22, lineHeight: 26, flexShrink: 1 },
+        coordsRow: { flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: 8 },
+        coordsText: { fontSize: 11.5, fontWeight: '600' },
+        appList: { flexDirection: 'column', gap: 8, marginTop: 16 },
+        appRow: { flexDirection: 'row', alignItems: 'center', gap: 12, width: '100%', padding: 12, minHeight: 62, borderRadius: 12 },
+        glyph: { width: 38, height: 38, borderRadius: 11, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+        txt: { flex: 1, minWidth: 0 },
+        nmRow: { flexDirection: 'row', alignItems: 'center', gap: 7, flexWrap: 'wrap' },
+        nm: { fontSize: 14.5, fontWeight: '700' },
+        rec: { fontSize: 9.5, fontWeight: '800', letterSpacing: 0.6, textTransform: 'uppercase', paddingVertical: 3, paddingHorizontal: 7, borderRadius: 100 },
+        recText: { fontSize: 9.5, fontWeight: '800', textTransform: 'uppercase' },
+        sb: { fontSize: 12, fontWeight: '600', marginTop: 2 },
+        radio: { width: 22, height: 22, borderRadius: 11, borderWidth: 2, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+        radioInd: { width: 11, height: 11, borderRadius: 5.5 },
+        remember: { flexDirection: 'row', alignItems: 'center', gap: 10, width: '100%', marginTop: 14, paddingVertical: 10, paddingHorizontal: 2, minHeight: 44 },
+        rememberBox: { width: 22, height: 22, borderRadius: 7, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+        rememberText: { fontSize: 13, fontWeight: '600' },
+        btnPrimary: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, width: '100%', minHeight: 50, borderRadius: 999, paddingVertical: 16, paddingHorizontal: 22 },
+        btnPrimaryText: { fontSize: 16, fontWeight: '700' },
+        btnGhost: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', width: '100%', minHeight: 46, borderRadius: 999, paddingVertical: 13, paddingHorizontal: 20 },
+        btnGhostText: { fontWeight: '700' },
+        routeStopsNote: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10, paddingVertical: 11, paddingHorizontal: 13, borderRadius: 12 },
+        routeStopsText: { fontSize: 12.5, fontWeight: '600', flex: 1, flexShrink: 1 },
+      }),
+    []
+  );
+}

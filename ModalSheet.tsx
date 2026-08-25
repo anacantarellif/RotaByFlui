@@ -1,0 +1,175 @@
+// Shared bottom-sheet wrapper around @gorhom/bottom-sheet, standing in for the web
+// prototype's `.sheet` CSS component (docs/HANDOFF.md §7 step 5: "Bottom sheets →
+// @gorhom/bottom-sheet (the CSS `.sheet` vira snapPoints)").
+//
+// Every ported *Sheet component (EventSheet, FilterSheet, MapsHandoffSheet,
+// RouteHandoffSheet, RateFlow, ...) should render its content through this instead
+// of managing its own sheet ref, so open/close, backdrop, handle styling, and
+// accessibility (role="dialog" aria-modal equivalent) stay consistent everywhere.
+//
+// Built on `BottomSheetModal`, not the plain `BottomSheet` this used before —
+// plain `BottomSheet` renders in place in the component tree, so a sheet opened
+// from a screen nested inside a tab (e.g. RateFlow from GuideDetail from
+// RouteScreen) could end up stacked *below* the bottom tab bar, which sits at a
+// higher level as a sibling of the tab navigator's screen content (reported: the
+// rating flow's "Continuar" button was unreachable, hidden behind the tab bar).
+// `BottomSheetModal` renders through a portal mounted at the app root
+// (`BottomSheetModalProvider` in App.tsx), so it's always on top of everything,
+// tab bar included, regardless of how deep the screen that opened it is nested.
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import { AccessibilityInfo, findNodeHandle, StyleSheet, View } from 'react-native';
+import { BottomSheetBackdrop, BottomSheetModal, BottomSheetScrollView, BottomSheetView } from '@gorhom/bottom-sheet';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTheme } from '../../theme/ThemeContext';
+
+// `open` mounts the modal and immediately calls `.present()`; flipping it back to
+// false calls `.dismiss()`, and once the close animation finishes `onDismiss`
+// fires `onClose`, which the parent uses to unmount us.
+
+export function ModalSheet({
+  open,
+  onClose,
+  snapPoints,
+  scroll = true,
+  label,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  // A single-number entry (e.g. `[measuredHeight]`) is exactly how a sheet
+  // that just stacks fixed content (no flex layout to fill) sizes itself
+  // precisely instead of guessing a percentage — see StationSheet's peek
+  // mode and EventSheet, both computed from an onLayout measurement of
+  // their own content. `enableDynamicSizing` looked like the built-in way
+  // to do this without a manual measurement, but it measured tall: both of
+  // those sheets opened with a visibly oversized gap below their last
+  // button that a same-height snapPoints entry doesn't have, so it's not
+  // used here at all — every *Sheet in this app passes explicit snapPoints.
+  snapPoints?: (string | number)[];
+  scroll?: boolean;
+  label: string; // accessibilityLabel for the dialog, e.g. "Reportar evento"
+  children: React.ReactNode;
+}) {
+  const { colors, space } = useTheme();
+  const insets = useSafeAreaInsets();
+  const ref = useRef<BottomSheetModal>(null);
+  const contentRef = useRef<View>(null);
+  // Tried adding `insets.bottom` to numeric (measured) entries here to
+  // compensate for the Body's own shrink below — overcorrected: the two
+  // sheets this was meant to fix (ReportSheet, the Maps/Waze handoffs) use
+  // `scroll` (BottomSheetScrollView), while the two sheets that were already
+  // correct without any adjustment (the station peek card, EventSheet) use
+  // `scroll={false}` (plain BottomSheetView) — reported as those two
+  // suddenly gaining a large blank gap they never had before. The two
+  // Body implementations evidently don't need the same compensation, so
+  // the real fix is making every content-hugging sheet use the
+  // `scroll={false}` path that was already proven correct, not patching
+  // ModalSheet itself — see `scroll={false}` on ReportSheet/MapsHandoffSheet/
+  // RouteHandoffSheet.
+  const points = useMemo(() => snapPoints ?? ['50%', '90%'], [snapPoints]);
+
+  useEffect(() => {
+    if (!open) return;
+    ref.current?.present();
+    const handle = findNodeHandle(contentRef.current);
+    if (handle) setTimeout(() => AccessibilityInfo.setAccessibilityFocus(handle), 260);
+  }, [open]);
+
+  // Content-hugging sheets (EventSheet, the station peek card, ReportSheet,
+  // the Maps/Waze handoff sheets) pass a single-entry `snapPoints` measured
+  // from their own content via onLayout, with a hardcoded guess for the
+  // very first frame before that measurement lands. `.present()` above
+  // fires in its own effect on mount, essentially always before that native
+  // onLayout round-trip completes — so it opens at the *guessed* height,
+  // and simply changing the `snapPoints` prop afterward does not, on its
+  // own, make an already-presented BottomSheetModal reflow to the new
+  // value (reported as sheets staying slightly clipped or oversized no
+  // matter how close the guess was). Explicitly re-snapping to index 0
+  // whenever `points` changes after the sheet is already open forces that
+  // reflow once the real measurement is in, instead of being stuck with
+  // whichever number was guessed at mount.
+  const hasPresented = useRef(false);
+  useEffect(() => {
+    if (!open) return;
+    if (!hasPresented.current) {
+      hasPresented.current = true;
+      return;
+    }
+    ref.current?.snapToIndex(0);
+  }, [points, open]);
+
+  const renderBackdrop = useCallback(
+    (props: any) => <BottomSheetBackdrop {...props} appearsOnIndex={0} disappearsOnIndex={-1} opacity={0.5} pressBehavior="close" />,
+    []
+  );
+
+  if (!open) return null;
+
+  const Body = scroll ? BottomSheetScrollView : BottomSheetView;
+
+  return (
+    <BottomSheetModal
+      ref={ref}
+      index={0}
+      snapPoints={points}
+      onDismiss={onClose}
+      enablePanDownToClose
+      // @gorhom/bottom-sheet defaults this to true, which makes the sheet
+      // auto-size to its rendered content's natural height instead of
+      // respecting `snapPoints`/`index` above. Every *Sheet in this app
+      // passes explicit snapPoints expecting them to be authoritative (e.g.
+      // RateFlow's single `['92%']` point, meant to open already fully
+      // expanded), so this stays off — leaving it at its default silently
+      // overrode that: sheets opened sized to however tall their content
+      // happened to measure, squeezing flex-based layouts like RateFlow's
+      // header/scroll-body/footer column into less height than they were
+      // built for (reported: the rating sheet not opening already expanded,
+      // and its footer button looking undersized as a result). This was
+      // also tried, briefly, as an opt-in for sheets with no flex layout to
+      // squeeze (the peek card, the report-detail card) instead of guessing
+      // a percentage snapPoint — it measured tall enough to leave its own
+      // visibly oversized gap below the last button, so those sheets
+      // measure their own content via onLayout and pass the exact result as
+      // a single-entry `snapPoints` instead; this stays hardcoded off.
+      enableDynamicSizing={false}
+      // Default stack behavior ('switch') *minimizes* whatever sheet is already
+      // registered when a new one mounts, instead of dismissing it — harmless
+      // when only one sheet is ever open, but here a station's peek→ficha→handoff
+      // flow closes one sheet and opens the next in the same tap (same React
+      // commit), so the outgoing sheet was getting minimized rather than
+      // dismissed and the new one never visibly took over (reported as "não
+      // consigo ver a ficha" / the Maps preview sheet not appearing). 'replace'
+      // makes that handoff an explicit dismiss-then-present instead.
+      stackBehavior="replace"
+      // Only affects where the sheet rests *off-screen* once dismissed — not
+      // the visible content area while it's open (that's the `Body` style
+      // below). Kept for a clean dismiss animation, but on its own this was
+      // mistakenly assumed to also keep open content clear of the system bar,
+      // which it doesn't — the "Continuar" button stayed cut off on 3-button
+      // nav devices even with this set.
+      bottomInset={insets.bottom}
+      backdropComponent={renderBackdrop}
+      backgroundStyle={{ backgroundColor: colors.surface, borderTopLeftRadius: space.radius, borderTopRightRadius: space.radius }}
+      handleIndicatorStyle={{ backgroundColor: colors.lineStrong, width: 36 }}
+      accessibilityViewIsModal
+      accessibilityLabel={label}
+    >
+      {/* A sheet's bottom edge always sits flush with the true screen bottom
+          (behind the system nav bar in Expo's edge-to-edge Android mode) —
+          the snap point only controls how tall the sheet is, not where its
+          bottom edge is. Pulling `bottom` in by `insets.bottom` shrinks the
+          content area itself to stop above the bar, so anything laid out with
+          flex — including a sticky footer button pinned to the end of a
+          flex:1 column, e.g. RateFlow's "Continuar" — lands above it instead
+          of needing every sheet to separately pad for the inset itself. */}
+      <Body
+        ref={contentRef as any}
+        style={[StyleSheet.absoluteFill, { bottom: insets.bottom }]}
+        contentContainerStyle={{ paddingBottom: 24 }}
+        accessible={false}
+      >
+        {children}
+      </Body>
+    </BottomSheetModal>
+  );
+}
