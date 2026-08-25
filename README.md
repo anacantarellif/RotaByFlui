@@ -2,11 +2,6 @@
 
 **Encontre, avalie e planeje suas recargas — feito por e para motoristas de veículos elétricos.**
 
-![Expo](https://img.shields.io/badge/Expo-SDK%2054-000020?logo=expo&logoColor=white)
-![React Native](https://img.shields.io/badge/React%20Native-0.81-61DAFB?logo=react&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-Strict-3178C6?logo=typescript&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20iOS-3DDC84?logo=android&logoColor=white)
-
 Projeto acadêmico desenvolvido para o **Enterprise Challenge (FIAP)** — Etapa 2. A Etapa 1 propôs a experiência em um protótipo navegável no Figma; esta etapa transforma essa proposta em um **aplicativo mobile real e funcional**, construído em React Native.
 
 ---
@@ -23,48 +18,6 @@ Motoristas de veículos elétricos enfrentam um problema muito específico: não
 - **Gamificação** (Watts, missões, conquistas) incentivando esse compartilhamento
 
 O app é organizado em quatro áreas, acessadas por navegação em abas: **Mapa · Rota · Comunidade · Perfil**.
-
-
-Capturas reais do aplicativo em funcionamento, em dispositivo Android:
-
-<table>
-<tr>
-<td width="50%">
-
-**Mapa + prévia do ponto**
-Toque em um pino para ver disponibilidade, nota e ações rápidas sem sair do mapa.
-
-<img src="mobile/docs/screenshots/mapa-peek.jpg" width="100%" />
-
-</td>
-<td width="50%">
-
-**Ficha do ponto de recarga**
-Foto real, Selo Flui, status, nota da comunidade e um comentário em destaque.
-
-<img src="mobile/docs/screenshots/ficha-hero.jpg" width="100%" />
-
-</td>
-</tr>
-<tr>
-<td width="50%">
-
-**Vozes da comunidade**
-Feed de avaliações, reportes e fotos enviadas por outros motoristas.
-
-<img src="mobile/docs/screenshots/comunidade-feed.jpg" width="100%" />
-
-</td>
-<td width="50%">
-
-**Reporte em tempo real**
-Situações reportadas por outros usuários, confirmadas pela comunidade.
-
-<img src="mobile/docs/screenshots/reporte-evento.jpg" width="100%" />
-
-</td>
-</tr>
-</table>
 
 ## ✨ Funcionalidades
 
@@ -107,16 +60,6 @@ npx expo start
 Pressione `a` para Android, `i` para iOS (simulador), ou escaneie o QR code com o app **Expo Go** em um aparelho físico.
 
 > O mapa (`react-native-maps`) precisa de uma build nativa para renderizar o Google Maps no Android — veja `mobile/README.md` para configurar a chave de API. No Expo Go, o app roda normalmente com o provedor de mapa padrão.
-
-Documentação técnica adicional (arquitetura, decisões de porte, plano de Android Auto) está em [`mobile/README.md`](mobile/README.md) e [`mobile/docs/`](mobile/docs/).
-
-
-```
-.
-├── mobile/     → o aplicativo React Native (a entrega desta etapa)
-├── project/    → protótipo HTML/Figma da Etapa 1 (referência de design)
-└── chats/      → histórico de decisões de design da Etapa 1
-```
 
 ## 👥 Equipe
 
