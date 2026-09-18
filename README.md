@@ -28,12 +28,12 @@ O app é organizado em quatro áreas, acessadas por navegação em abas: **Mapa 
 
 Recurso tratado como requisito funcional, não como polimento final — construído e depois **testado com leitor de tela (TalkBack) em aparelho real**:
 
-- Cartões e grupos de informação lidos como um bloco lógico só, não elemento por elemento
-- Mudanças de estado anunciadas em voz alta (curtir, marcar como útil, ajustar bateria)
-- Controles com gesto próprio (ex.: barra de bateria) ganham uma alternativa tocável quando um leitor de tela é detectado
-- Toda folha deslizante (bottom sheet) tem um botão de fechar alcançável, sem depender só de gesto
-- Animações respeitam a preferência "reduzir movimento" do sistema
-- Visualização em lista assumida por padrão quando um leitor de tela está ativo
+- Cartões e grupos de informação lidos como um bloco lógico só, não elemento por elemento;
+- Mudanças de estado anunciadas em voz alta (curtir, marcar como útil, ajustar bateria);
+- Controles com gesto próprio (ex.: barra de bateria) ganham uma alternativa tocável quando um leitor de tela é detectado;
+- Toda folha deslizante (bottom sheet) tem um botão de fechar alcançável, sem depender só de gesto;
+- Animações respeitam a preferência "reduzir movimento" do sistema;
+- Visualização em lista assumida por padrão quando um leitor de tela está ativo;
 
 ## 🛠️ Tecnologias
 
