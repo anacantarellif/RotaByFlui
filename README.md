@@ -1,53 +1,60 @@
-# Rota by Flui — React Native app
+# ⚡ Rota by Flui
+---
 
-React Native (Expo/TypeScript) port of the HTML/React prototype in `../project/`.
-See `../project/docs/HANDOFF.md` for the original design spec, `../PORTING_GUIDE.md`
-for the conventions this port follows, and `docs/ANDROID_AUTO_PLAN.md` for the
-Android Auto phase (planned, not yet built).
+## 🚗 Sobre o projeto
 
-This exists because the FIAP "Enterprise Challenge" Stage 2 brief requires a
-functional mobile app (React Native or similar) with a real interactive map,
-station detail, and working search filters, published to a public GitHub repo
-(see `../chats/chat2.md`) — the `project/` folder is the executable design spec
-for it, not the deliverable itself.
+Motoristas de veículos elétricos enfrentam um problema muito específico: não basta encontrar *um* posto de recarga no mapa — é preciso saber se aquele posto está disponível agora, se atende ao carro específico do motorista, e se vale a pena o desvio. O **Rota by Flui** resolve isso reunindo, num só lugar:
 
-## Running it
+- Um **mapa interativo** com status de disponibilidade em tempo real
+- Uma **ficha completa** de cada ponto — fotos reais, especificações técnicas, comodidades, avaliações
+- Uma **estimativa de recarga calculada para o carro do usuário** (capacidade de bateria, curva de carga, compatibilidade de conector), não um número genérico
+- **Roteiros de viagem curados** (Guia Flui) com paradas de recarga já planejadas
+- Uma **camada de comunidade** — reportes, avaliações e fotos de outros motoristas mantendo as informações atualizadas
+- **Gamificação** (Watts, missões, conquistas) incentivando esse compartilhamento
 
-```
-cd mobile
+O app é organizado em quatro áreas, acessadas por navegação em abas: **Mapa · Rota · Comunidade · Perfil**.
+
+## ✨ Funcionalidades
+
+| Área | O que tem |
+|---|---|
+| **Mapa** | Busca por texto, chips de filtro rápido, folha de filtros avançados, alternância mapa/lista, recentralização na localização do usuário |
+| **Ficha do ponto** | Foto real, status e disponibilidade (X/Y vagas), Selo Flui, grade de especificações, tempo de carga estimado para o carro do usuário, comodidades, avaliações reais, favoritar/reportar/navegar |
+| **Rota** | Planejador com estimativa de bateria na chegada e compatibilidade de conector; Guia Flui com roteiros curados e handoff de navegação (Google Maps / Waze) |
+| **Comunidade** | Feed de atividade, avaliações com fotos, reportes (fila, fora do ar, preço, vaga bloqueada), curtidas |
+| **Perfil** | Carro selecionado, pontos favoritos, pontuação (Watts), conquistas, tema, configurações de acessibilidade |
+
+## ♿ Acessibilidade
+
+Recurso tratado como requisito funcional, não como polimento final — construído e depois **testado com leitor de tela (TalkBack) em aparelho real**:
+
+- Cartões e grupos de informação lidos como um bloco lógico só, não elemento por elemento
+- Mudanças de estado anunciadas em voz alta (curtir, marcar como útil, ajustar bateria)
+- Controles com gesto próprio (ex.: barra de bateria) ganham uma alternativa tocável quando um leitor de tela é detectado
+- Toda folha deslizante (bottom sheet) tem um botão de fechar alcançável, sem depender só de gesto
+- Animações respeitam a preferência "reduzir movimento" do sistema
+- Visualização em lista assumida por padrão quando um leitor de tela está ativo
+
+## 🛠️ Tecnologias
+
+- [Expo](https://expo.dev) (SDK 57) + React Native + TypeScript
+- [@gorhom/bottom-sheet](https://gorhom.dev/react-native-bottom-sheet/) para as folhas deslizantes
+- [expo-image](https://docs.expo.dev/versions/latest/sdk/image/) para fotografia real
+- [Lottie](https://airbnb.io/lottie/) para animações de destaque
+- Contextos próprios (React Context + AsyncStorage) para carro, favoritos, pontuação e avaliações — sem backend
+
+## 🚀 Rodando o projeto
+
+```bash
 npm install
 npx expo start
 ```
 
-Press `a` for Android, `i` for iOS (simulator), or scan the QR code with Expo Go
-on a physical device. `react-native-maps` needs a native build to render Google
-Maps on Android (see below) — Expo Go can still run the app with the map showing
-its default/fallback provider.
+## 👥 Equipe
 
-## Adding a Google Maps API key
+- Ana Carolina Cantarelli Fernandes — RM 561491
+- Sarah Gonçalves Garcia — RM 563539
 
-Edit `src/config.ts`:
+---
 
-```ts
-export const ROTA_CONFIG = {
-  googleMapsApiKey: 'YOUR_KEY_HERE',
-  ...
-};
-```
-
-Then wire the same key into native config (see `../project/docs/MAPS.md` §4 for
-the underlying requirements):
-- `app.json` → `expo.android.config.googleMaps.apiKey`
-- `app.json` → `expo.ios.config.googleMapsApiKey`
-
-Restrict the key by package name / bundle id in Google Cloud Console and enable
-*Maps SDK for Android*, *Maps SDK for iOS*, *Directions API*, *Places API*.
-
-## Status
-
-Ported from `project/app/*.jsx` per `../PORTING_GUIDE.md`. Foundation (theme,
-data, icons, config, skeletons, map, navigation shell) is done; screen-level
-ports were built by parallel implementation passes — see git history / task
-notes for what's complete vs. still a placeholder at any given point.
-
-Not yet started: Android Auto (`docs/ANDROID_AUTO_PLAN.md`).
+*Projeto acadêmico desenvolvido para o Enterprise Challenge — FIAP.*
